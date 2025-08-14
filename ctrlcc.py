@@ -1,58 +1,50 @@
 import os
 import sys
-import pyperclip
 import keyboard
-from threading import Timer
 from pystray import MenuItem as item
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image
 from ctypes import windll
 import winreg as reg
 import win32event
 import win32api
 from winerror import ERROR_ALREADY_EXISTS
-import logging
-import subprocess
+import re
+import time
+import win32clipboard as wcb
+import win32con
+import pywintypes
+
+# Precompiled regex patterns for performance
+RE_NEWLINES = re.compile(r"(\r\n|\r|\n)+")
+RE_SPACES = re.compile(r"[ \t\u00A0\u2000-\u200A\u202F\u205F\u3000]+")
 
 
-def get_log_file_path():
-    """Get the path for the log file, differentiating between script and executable."""
-    if getattr(sys, 'frozen', False):
-        home_dir = os.path.expanduser('~')
-        log_dir = os.path.join(home_dir, 'ctrlcc')
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        return os.path.join(log_dir, 'CtrlC_C_log.txt')
-    else:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'CtrlC_C_log.txt')
-
-
-def view_logs(icon, item):
-    """Open the log file with the default text editor."""
-    try:
-        if os.name == 'nt':  # Windows
-            os.startfile(log_filepath)
-        elif os.name == 'posix':  # Unix-like
-            subprocess.run(['open', log_filepath], check=True)
-        else:
-            logging.error("Unsupported OS for viewing logs")
-    except Exception as e:
-        logging.error(f"Error opening log file: {e}")
+DOUBLE_PRESS_THRESHOLD = 0.6  # seconds
+POST_COPY_DELAY = 0.03  # seconds, allow the second Ctrl+C to update clipboard
 
 
 def add_to_startup():
     """Add the application to the Windows startup registry."""
     if getattr(sys, 'frozen', False):
-        app_path = sys.executable
+        # Executable produced by a freezing tool (e.g., PyInstaller)
+        startup_command = f'"{sys.executable}"'
     else:
-        app_path = os.path.abspath(__file__)
+        # Use pythonw if available to avoid a console window
+        script_path = os.path.abspath(__file__)
+        interpreter = sys.executable
+        if interpreter.lower().endswith('python.exe'):
+            candidate = interpreter[:-4] + 'w.exe'
+            if os.path.exists(candidate):
+                interpreter = candidate
+        startup_command = f'"{interpreter}" "{script_path}"'
 
     try:
         key = reg.HKEY_CURRENT_USER
         key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        open = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
-        reg.SetValueEx(open, "CtrlC+C", 0, reg.REG_SZ, app_path)
-        reg.CloseKey(open)
+        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
+        reg.SetValueEx(key_handle, "CtrlC+C", 0, reg.REG_SZ, startup_command)
+        reg.CloseKey(key_handle)
         return True
     except WindowsError:
         return False
@@ -63,15 +55,15 @@ def remove_from_startup():
     try:
         key = reg.HKEY_CURRENT_USER
         key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        open = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
-        reg.DeleteValue(open, "CtrlC+C")
-        reg.CloseKey(open)
+        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
+        reg.DeleteValue(key_handle, "CtrlC+C")
+        reg.CloseKey(key_handle)
         return True
     except WindowsError:
         return False
 
 
-def toggle_startup():
+def toggle_startup(icon, item):
     """Toggle whether the application is in the Windows startup registry."""
     if is_in_startup():
         return remove_from_startup()
@@ -84,9 +76,9 @@ def is_in_startup():
     try:
         key = reg.HKEY_CURRENT_USER
         key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        open = reg.OpenKey(key, key_value, 0, reg.KEY_READ)
-        reg.QueryValueEx(open, "CtrlC+C")
-        reg.CloseKey(open)
+        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_READ)
+        reg.QueryValueEx(key_handle, "CtrlC+C")
+        reg.CloseKey(key_handle)
         return True
     except WindowsError:
         return False
@@ -97,7 +89,7 @@ def show_message_box(title, message):
     return windll.user32.MessageBoxW(0, message, title, 0)
 
 
-def toggle_strip_blankspace():
+def toggle_strip_blankspace(icon, item):
     """Toggle whether to remove blank space from copied text."""
     global is_strip_blankspace
     is_strip_blankspace = not is_strip_blankspace
@@ -107,89 +99,91 @@ def toggle_strip_blankspace():
 def strip_newlines(text):
     """Remove all types of newline characters from a string."""
     try:
-        text = text.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
-        logging.info(f"removed newlines: {text}")  # Log the stripped text
-        return text
+        # Collapse any sequence of CR/LF into a single space
+        return RE_NEWLINES.sub(" ", text)
     except Exception as e:
-        logging.error(f"Error while accessing clipboard: {e}")
         return ""
 
 
 def strip_blankspace(text):
     """Remove all types of blank space characters from a string."""
     try:
-        text = text.replace(' ', '')
-        logging.info(f"removed blank space: {text}")  # Log the stripped text
-        return text
+        # Remove common space characters: normal space, no-break space, tabs and a range of unicode spaces
+        return RE_SPACES.sub("", text)
     except Exception as e:
-        logging.error(f"Error while accessing clipboard: {e}")
         return ""
 
 
 def get_clipboard_text():
-    """Get the current text on the clipboard and then clear it."""
-    try:
-        text = pyperclip.paste()
-        pyperclip.copy("")  # Clear the clipboard
-        return text
-    except Exception as e:
-        logging.error(f"Error while accessing clipboard: {e}")
-        return ""
+    """Windows: robustly read Unicode text from clipboard with retries."""
+    for _ in range(5):
+        try:
+            wcb.OpenClipboard()
+            try:
+                if wcb.IsClipboardFormatAvailable(wcb.CF_UNICODETEXT):
+                    data = wcb.GetClipboardData(wcb.CF_UNICODETEXT)
+                    return data if isinstance(data, str) else str(data)
+                return ""
+            finally:
+                wcb.CloseClipboard()
+        except pywintypes.error:
+            time.sleep(0.03)
+        except Exception:
+            time.sleep(0.03)
+    return ""
 
 
 def set_clipboard_text(text):
-    """Set the given text on the clipboard."""
-    pyperclip.copy(text)
+    """Windows: robustly write Unicode text to clipboard with retries."""
+    if text is None:
+        text = ""
+    for _ in range(5):
+        try:
+            wcb.OpenClipboard()
+            try:
+                wcb.EmptyClipboard()
+                wcb.SetClipboardData(wcb.CF_UNICODETEXT, text)
+                return True
+            finally:
+                wcb.CloseClipboard()
+        except pywintypes.error:
+            time.sleep(0.03)
+        except Exception:
+            time.sleep(0.03)
+    return False
 
 
 def on_c_press(event):
-    global strip_attempted
-    """Start a timer after first 'C' press, if 'Ctrl' is held down"""
+    """Detect Ctrl held and double press of 'C' within threshold, no timers."""
+    global last_c_time
     if keyboard.is_pressed('ctrl'):
-        if hasattr(on_c_press, 'first_press_timer') and on_c_press.first_press_timer is not None:
-            # If timer exists, we are within 1.0 seconds of first press, so we execute the action
-            on_c_press.first_press_timer.cancel()
-            strip_attempted = True
+        now = time.monotonic()
+        if last_c_time and (now - last_c_time) <= DOUBLE_PRESS_THRESHOLD:
+            last_c_time = 0.0
             perform_clipboard_action()
-            Timer(0.5, check_conflict).start()
         else:
-            # Start a timer that waits for another 'C' press within 1.0 seconds
-            on_c_press.first_press_timer = Timer(1.0, reset_first_press_timer)
-            on_c_press.first_press_timer.start()
+            last_c_time = now
     else:
-        reset_first_press_timer()
+        last_c_time = 0.0
 
 
-def check_conflict():
-    """Check if strip_newlines was attempted but not executed, indicating a hotkey conflict."""
-    global strip_attempted, strip_executed
-    if strip_attempted and not strip_executed:
-        # If strip_newlines was attempted but not executed, then we might have a conflict
-        show_message_box("快捷键冲突", "Ctrl+C+C 快捷键可能被其他程序占用。")
-    # Reset flags for the next attempt
-    strip_attempted = False
-    strip_executed = False
+# Conflict check removed for Windows-only lightweight build
 
 
 def perform_clipboard_action():
     """Perform the action of copying the clipboard text and removing newlines."""
-    global strip_executed
-    reset_first_press_timer()
-    try:
-        current_data = get_clipboard_text()
-        stripped_text = strip_newlines(current_data)
-        if is_strip_blankspace:
-            stripped_text = strip_blankspace(stripped_text)
-        set_clipboard_text(stripped_text)
-        logging.info(f"Stripped text: {stripped_text}")
-        strip_executed = True
-    except Exception as e:
-        logging.error(f"Error in perform_clipboard_action: {e}")
+    time.sleep(POST_COPY_DELAY)
+    current_data = get_clipboard_text()
+    if not current_data:
+        return
+    processed = strip_newlines(current_data)
+    if is_strip_blankspace:
+        processed = strip_blankspace(processed)
+    if processed != current_data:
+        set_clipboard_text(processed)
 
 
-def reset_first_press_timer():
-    """Reset the timer for double 'C' press"""
-    on_c_press.first_press_timer = None
+# Timer-based state removed
 
 
 def create_icon(image_name):
@@ -198,11 +192,15 @@ def create_icon(image_name):
         base_path = sys._MEIPASS
     # The application is not frozen
     else:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
 
     # Correct the path to the icon file
     icon_path = os.path.join(base_path, image_name)
-    return Image.open(icon_path)
+    try:
+        return Image.open(icon_path)
+    except Exception:
+        # Fallback: create a simple solid-color icon to avoid crashing if the ICO is missing
+        return Image.new("RGB", (64, 64), (40, 110, 140))
 
 
 def setup_tray_icon():
@@ -213,7 +211,6 @@ def setup_tray_icon():
     menu = (item('Toggle Start on Boot', toggle_startup, checked=lambda item: is_in_startup()),
             item('Toggle Strip Blank Space', toggle_strip_blankspace,
                  checked=lambda item: is_strip_blankspace),
-            item('View Logs', view_logs),
             item('Exit', exit_program),)
     icon = pystray.Icon("test_icon", icon_image, "CtrlC+C", menu)
     icon.run()
@@ -227,14 +224,7 @@ def exit_program(icon, item):
 
 
 if __name__ == "__main__":
-
-    log_filepath = get_log_file_path()
-    logging.basicConfig(filename=log_filepath, level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-
-    strip_attempted = False
-    strip_executed = False
-
+    last_c_time = 0.0
     is_strip_blankspace = False
 
     mutex_name = "CtrlC_C_Application_Mutex"
@@ -257,9 +247,5 @@ if __name__ == "__main__":
     show_message_box("© 2023 Glenn.", instruction_message)
 
     # Initialization and event hooks
-    # print("Hold Ctrl and press C twice to copy text and remove newlines...")
-    # print("Press Esc to quit.")
-    on_c_press.first_press_timer = None
     keyboard.on_release_key('c', on_c_press)
-    # keyboard.add_hotkey('esc', lambda: exit_program(None, None))  # Adapted for direct call
     setup_tray_icon()  # Start the system tray icon
