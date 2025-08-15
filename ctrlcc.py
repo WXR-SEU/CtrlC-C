@@ -20,68 +20,10 @@ RE_NEWLINES = re.compile(r"(\r\n|\r|\n)+")
 RE_SPACES = re.compile(r"[ \t\u00A0\u2000-\u200A\u202F\u205F\u3000]+")
 
 
-DOUBLE_PRESS_THRESHOLD = 0.6  # seconds
-POST_COPY_DELAY = 0.03  # seconds, allow the second Ctrl+C to update clipboard
+DOUBLE_PRESS_THRESHOLD = 1.0  # seconds
+POST_COPY_DELAY = 0.1  # seconds, allow the second Ctrl+C to update clipboard
 
 
-def add_to_startup():
-    """Add the application to the Windows startup registry."""
-    if getattr(sys, 'frozen', False):
-        # Executable produced by a freezing tool (e.g., PyInstaller)
-        startup_command = f'"{sys.executable}"'
-    else:
-        # Use pythonw if available to avoid a console window
-        script_path = os.path.abspath(__file__)
-        interpreter = sys.executable
-        if interpreter.lower().endswith('python.exe'):
-            candidate = interpreter[:-4] + 'w.exe'
-            if os.path.exists(candidate):
-                interpreter = candidate
-        startup_command = f'"{interpreter}" "{script_path}"'
-
-    try:
-        key = reg.HKEY_CURRENT_USER
-        key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
-        reg.SetValueEx(key_handle, "CtrlC+C", 0, reg.REG_SZ, startup_command)
-        reg.CloseKey(key_handle)
-        return True
-    except WindowsError:
-        return False
-
-
-def remove_from_startup():
-    """Remove the application from the Windows startup registry."""
-    try:
-        key = reg.HKEY_CURRENT_USER
-        key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
-        reg.DeleteValue(key_handle, "CtrlC+C")
-        reg.CloseKey(key_handle)
-        return True
-    except WindowsError:
-        return False
-
-
-def toggle_startup(icon, item):
-    """Toggle whether the application is in the Windows startup registry."""
-    if is_in_startup():
-        return remove_from_startup()
-    else:
-        return add_to_startup()
-
-
-def is_in_startup():
-    """Check whether the application is in the Windows startup registry."""
-    try:
-        key = reg.HKEY_CURRENT_USER
-        key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_READ)
-        reg.QueryValueEx(key_handle, "CtrlC+C")
-        reg.CloseKey(key_handle)
-        return True
-    except WindowsError:
-        return False
 
 
 def show_message_box(title, message):
@@ -208,8 +150,7 @@ def setup_tray_icon():
     icon_image = create_icon("ctrlcc.ico")
 
     # The menu that will appear when the user right-clicks the icon
-    menu = (item('Toggle Start on Boot', toggle_startup, checked=lambda item: is_in_startup()),
-            item('Toggle Strip Blank Space', toggle_strip_blankspace,
+    menu = (item('Toggle Strip Blank Space', toggle_strip_blankspace,
                  checked=lambda item: is_strip_blankspace),
             item('Exit', exit_program),)
     icon = pystray.Icon("test_icon", icon_image, "CtrlC+C", menu)
@@ -223,9 +164,26 @@ def exit_program(icon, item):
     # print("Exiting program...")
 
 
+def cleanup_startup_entry():
+    """Best-effort removal of any existing startup registry entry."""
+    try:
+        key = reg.HKEY_CURRENT_USER
+        key_value = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        key_handle = reg.OpenKey(key, key_value, 0, reg.KEY_ALL_ACCESS)
+        try:
+            reg.DeleteValue(key_handle, "CtrlC+C")
+        finally:
+            reg.CloseKey(key_handle)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     last_c_time = 0.0
     is_strip_blankspace = False
+
+    # Ensure any legacy startup entry is removed
+    cleanup_startup_entry()
 
     mutex_name = "CtrlC_C_Application_Mutex"
 
@@ -236,15 +194,7 @@ if __name__ == "__main__":
         show_message_box("应用程序已运行", "CtrlC+C 应用程序已经在运行了。")
         sys.exit(0)
 
-    # Show instruction message box
-    instruction_message = (
-        "欢迎使用 CtrlC+C ！\n"
-        "\n"
-        "【按住 Ctrl 键并按 C 键两次】以复制文本并删除换行。\n"
-        "\n"
-        "如有问题，请联系：chenluda01@gmail.com"
-    )
-    show_message_box("© 2023 Glenn.", instruction_message)
+    # Instruction message box removed by user request
 
     # Initialization and event hooks
     keyboard.on_release_key('c', on_c_press)
